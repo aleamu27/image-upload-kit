@@ -34,6 +34,16 @@ and fixed:
 - **Preview used `FileReader.readAsDataURL`**, which base64-encodes the whole file into memory. Swapped for `URL.createObjectURL` (cheaper) with proper revocation on replace/reset/unmount.
 - **Drag-over state flickered** on any project using a naive `dragenter`/`dragleave` toggle once the drop zone had nested elements (as the original did) — fixed with a drag-enter counter in `Dropzone`.
 
+A second pass over this module itself (not the original) turned up more:
+
+- **Selecting a new file while a previous upload was still in flight raced.** The old XHR reference just got overwritten — the earlier upload kept running in the background, could still resolve and fire `onSuccess` with stale data, and `abort()`/`reset()` only ever controlled the newest one. `selectFile` now aborts anything in flight before starting, and every async step checks a request token so a superseded operation can't write state even if it had already resolved before `abort()` took effect.
+- **`onSuccess`/`allowedTypes` broke memoization** the same way an earlier version of `cookie-consent-kit` did — passing an inline function/array (as this README's own examples do) gave `selectFile` a new identity every render. Now read from a ref that's kept current via an effect, not closed over directly.
+- **`maxSizeMB` was never actually enforced in presign mode.** The presign route only checks the client's *claimed* `fileSize` before issuing the URL — nothing about a presigned PUT caps what a client can then upload directly to R2. `confirm-upload-route.ts` now reads the object's real, server-reported size (`HeadObjectCommand`) and deletes it if it exceeds the limit, the same way it already did for byte-signature verification.
+- **A non-image file still got a broken preview shown next to its error.** `validate()` now distinguishes "not an image at all" (clears the preview) from "a real image that's just too big/wrong type" (keeps it, so the error has context).
+- **The presign and confirm requests weren't abortable** — only the XHR upload phase was. `abort()` now cancels whichever phase is active via an `AbortController`.
+- **The proxy route's size pre-check could be skipped** by omitting `Content-Length`, and `request.formData()` fully buffers the body regardless of any pre-check anyway (a hard platform limitation of the Web Request API, not something this module can work around). It now also checks `file.size` — the runtime's actual buffered value, not a header — immediately after parsing and before allocating a second buffer via `arrayBuffer()`.
+- **A transient R2 read failure right after upload would delete a genuinely valid image.** `confirm-upload-route.ts`'s verification read is now retried (3 attempts, backoff) before concluding the upload is invalid.
+
 ## Install
 
 Source-only, no build step — copy this folder into your project, or:
@@ -112,13 +122,13 @@ useImageUpload({
 - **`sniffImageMimeType`** (shared core) — the same byte-signature check used client-side and server-side, so "does this look like a real image" is answered identically in both places.
 - **`validateImageBuffer`** (server) — the authoritative check: size + real content type, ignoring whatever the client claimed.
 - **`createR2Client` / `loadR2ConfigFromEnv`** (server) — throws with the exact missing env var name instead of silently mocking.
-- **`createPresignedUpload` / `fetchObjectHeadBytes` / `deleteR2Object`** (server) — the presign-mode building blocks, including the "read back just enough bytes to verify" trick `confirm-upload-route.ts` uses.
+- **`createPresignedUpload` / `fetchObjectHeadBytes` / `fetchObjectSize` / `deleteR2Object`** (server) — the presign-mode building blocks, including the "read back just enough bytes, and the real size, to verify" trick `confirm-upload-route.ts` uses.
 - **`checkRateLimit` / `isRequestTooLarge` / `getClientIP`** (server) — used by all four route templates.
 
 ## Security notes
 
 - **SVG is deliberately not in the allowed type list.** SVGs can embed `<script>` and are a well-known stored-XSS vector when user-uploaded and served back to other visitors. Add SVG support only with a dedicated sanitizer (e.g. DOMPurify's SVG mode) in front of it — never accept raw SVG bytes.
-- **Presign mode has an inherent gap that `confirmEndpoint` closes**: a presigned PUT URL constrains the `Content-Type` header (via the request signature) but the storage layer doesn't sniff actual bytes — without the confirm step, a client could PUT non-image bytes under a spoofed-but-signature-matching Content-Type. Don't skip `confirmEndpoint` in presign mode.
+- **Presign mode has inherent gaps that `confirmEndpoint` closes**: a presigned PUT URL constrains the `Content-Type` header (via the request signature) but the storage layer doesn't sniff actual bytes, and doesn't cap upload size either — without the confirm step, a client could PUT non-image bytes under a spoofed-but-signature-matching Content-Type, or a file far larger than what it claimed when requesting the URL. Don't skip `confirmEndpoint` in presign mode.
 - **`getClientIP`/rate limiting assumes a trusted proxy** (see its doc comment) — spoofable if self-hosted without one.
 
 ## Ideas to make it more robust

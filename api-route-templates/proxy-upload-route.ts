@@ -9,6 +9,17 @@
  * larger files, use presign-upload-route.ts instead, which uploads
  * directly to R2 and isn't bound by that ceiling.
  *
+ * Note on the size checks below: `request.formData()` has to read the
+ * entire multipart body into memory to parse it — there's no way to
+ * stream-reject an oversized file partway through with the standard Web
+ * Request API, so the isRequestTooLarge() pre-check (which can be skipped
+ * entirely if the client omits Content-Length) is only ever a best-effort
+ * early-out, not a hard ceiling on memory use. `file.size` is checked
+ * again immediately after parsing — that value comes from the runtime's
+ * already-buffered result, not a header, so it's accurate — specifically
+ * to avoid allocating a second, unnecessary copy of an oversized file via
+ * arrayBuffer() before rejecting it.
+ *
  * Add your own authentication/authorization check where marked — this
  * template intentionally doesn't assume any particular auth system.
  */
@@ -46,6 +57,10 @@ export async function POST(request: NextRequest) {
   const file = formData.get('file')
   if (!(file instanceof File)) {
     return NextResponse.json({ error: 'No file provided' }, { status: 400 })
+  }
+
+  if (file.size > MAX_SIZE_MB * 1024 * 1024) {
+    return NextResponse.json({ error: `File exceeds ${MAX_SIZE_MB}MB limit` }, { status: 413 })
   }
 
   const bytes = new Uint8Array(await file.arrayBuffer())

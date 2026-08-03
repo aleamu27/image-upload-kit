@@ -26,7 +26,7 @@ export interface UseImageUploadOptions {
    * Default '/api/upload/image'.
    */
   endpoint?: string
-  /** 'presign' mode only — verifies the object's real bytes after the client's PUT completes. Default '/api/upload/confirm'. Pass null to skip (not recommended). */
+  /** 'presign' mode only — verifies the object's real bytes (and size) after the client's PUT completes. Default '/api/upload/confirm'. Pass null to skip (not recommended). */
   confirmEndpoint?: string | null
   maxSizeMB?: number
   allowedTypes?: string[]
@@ -41,13 +41,15 @@ export interface UseImageUploadResult {
   progress: number
   errorMessage: string | null
   selectFile: (file: File) => Promise<void>
-  /** Cancels an in-flight upload. */
+  /** Cancels whatever's currently in flight — the presign request, the upload itself, or the confirm request. */
   abort: () => void
   reset: () => void
 }
 
 const DEFAULT_MAX_SIZE_MB = 10
 const DEFAULT_ALLOWED_TYPES = Object.keys(ALLOWED_IMAGE_TYPES)
+
+type ActiveOperation = { kind: 'xhr'; xhr: XMLHttpRequest } | { kind: 'fetch'; controller: AbortController } | null
 
 function uploadViaXHR(
   url: string,
@@ -93,6 +95,20 @@ function uploadViaXHR(
   })
 }
 
+async function fetchJSON(url: string, body: unknown, signal: AbortSignal): Promise<any> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  })
+  if (!response.ok) {
+    const errorBody = await response.json().catch(() => ({}))
+    throw new Error(errorBody?.error || `Request failed (${response.status})`)
+  }
+  return response.json()
+}
+
 /**
  * Handles file validation (real byte-signature sniffing, not just the
  * browser-reported MIME type), an efficient object-URL preview with proper
@@ -105,8 +121,6 @@ export function useImageUpload(options?: UseImageUploadOptions): UseImageUploadR
   const endpoint = options?.endpoint ?? '/api/upload/image'
   const confirmEndpoint = options?.confirmEndpoint === null ? null : options?.confirmEndpoint ?? '/api/upload/confirm'
   const maxSizeMB = options?.maxSizeMB ?? DEFAULT_MAX_SIZE_MB
-  const allowedTypes = options?.allowedTypes ?? DEFAULT_ALLOWED_TYPES
-  const onSuccess = options?.onSuccess
 
   const [preview, setPreview] = useState<string | null>(null)
   const [status, setStatus] = useState<UploadStatus>('idle')
@@ -114,7 +128,25 @@ export function useImageUpload(options?: UseImageUploadOptions): UseImageUploadR
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
   const previewUrlRef = useRef<string | null>(null)
-  const xhrRef = useRef<XMLHttpRequest | null>(null)
+  const activeOperation = useRef<ActiveOperation>(null)
+  // Bumped on every selectFile()/reset() call — lets an in-flight async
+  // operation notice it's been superseded and bail out silently instead of
+  // overwriting state with a stale result, even if abort() didn't manage
+  // to stop it in time (e.g. it had already resolved).
+  const requestToken = useRef(0)
+
+  // Read via .current inside callbacks instead of closing over the option
+  // directly, so selectFile's own identity doesn't change just because a
+  // caller passed a fresh inline array/function on every render (as this
+  // module's own README usage examples do for onSuccess).
+  const onSuccessRef = useRef(options?.onSuccess)
+  const allowedTypesRef = useRef(options?.allowedTypes ?? DEFAULT_ALLOWED_TYPES)
+  useEffect(() => {
+    onSuccessRef.current = options?.onSuccess
+  }, [options?.onSuccess])
+  useEffect(() => {
+    allowedTypesRef.current = options?.allowedTypes ?? DEFAULT_ALLOWED_TYPES
+  }, [options?.allowedTypes])
 
   const setPreviewFile = useCallback((file: File | null) => {
     if (previewUrlRef.current) {
@@ -130,40 +162,64 @@ export function useImageUpload(options?: UseImageUploadOptions): UseImageUploadR
     }
   }, [])
 
-  // Revoke on unmount too, not just on the next selection/reset.
   useEffect(() => {
     return () => {
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current)
     }
   }, [])
 
-  const validate = useCallback(
-    async (file: File): Promise<string | null> => {
-      if (file.size === 0) return 'File is empty'
-      if (file.size > maxSizeMB * 1024 * 1024) return `File must be smaller than ${maxSizeMB}MB`
+  const abort = useCallback(() => {
+    const op = activeOperation.current
+    if (op?.kind === 'xhr') op.xhr.abort()
+    else if (op?.kind === 'fetch') op.controller.abort()
+  }, [])
 
-      // Sniff real bytes rather than trusting file.type — a renamed file
-      // claiming to be an image would otherwise sail through. This is a
-      // fast first line of defense; the server (proxy mode inline, or
-      // confirmEndpoint in presign mode) repeats it as the real gate.
+  /**
+   * Sniffs the real bytes rather than trusting file.type — a renamed file
+   * claiming to be an image would otherwise sail through. This is a fast
+   * first line of defense; the server (proxy mode inline, or
+   * confirmEndpoint in presign mode) repeats it as the real gate.
+   *
+   * Distinguishes "not an image at all" from "a real image that's just
+   * too big/wrong type" so selectFile can decide whether the preview is
+   * still worth keeping around next to the error.
+   */
+  const validate = useCallback(
+    async (file: File): Promise<{ error: string | null; isRecognizedImage: boolean }> => {
+      if (file.size === 0) return { error: 'File is empty', isRecognizedImage: false }
+
       const head = new Uint8Array(await file.slice(0, 16).arrayBuffer())
       const sniffed = sniffImageMimeType(head)
-      if (!sniffed) return 'This file is not a recognized image format'
-      if (!allowedTypes.includes(sniffed)) return `${sniffed} images are not allowed here`
+      if (!sniffed) return { error: 'This file is not a recognized image format', isRecognizedImage: false }
 
-      return null
+      if (file.size > maxSizeMB * 1024 * 1024) {
+        return { error: `File must be smaller than ${maxSizeMB}MB`, isRecognizedImage: true }
+      }
+      if (!allowedTypesRef.current.includes(sniffed)) {
+        return { error: `${sniffed} images are not allowed here`, isRecognizedImage: true }
+      }
+
+      return { error: null, isRecognizedImage: true }
     },
-    [maxSizeMB, allowedTypes]
+    [maxSizeMB]
   )
 
   const selectFile = useCallback(
     async (file: File) => {
+      // A new selection always wins — stop whatever was running and make
+      // sure it can't overwrite state after this call has moved on.
+      abort()
+      const myToken = ++requestToken.current
+
       setErrorMessage(null)
       setProgress(0)
       setStatus('validating')
-      setPreviewFile(file)
 
-      const validationError = await validate(file)
+      const { error: validationError, isRecognizedImage } = await validate(file)
+      if (requestToken.current !== myToken) return // superseded while validating
+
+      setPreviewFile(isRecognizedImage ? file : null)
+
       if (validationError) {
         setErrorMessage(validationError)
         setStatus('error')
@@ -180,53 +236,50 @@ export function useImageUpload(options?: UseImageUploadOptions): UseImageUploadR
             endpoint,
             'POST',
             formData,
-            (xhr) => (xhrRef.current = xhr),
+            (xhr) => (activeOperation.current = { kind: 'xhr', xhr }),
             setProgress
           )
-          xhrRef.current = null
+          if (requestToken.current !== myToken) return
+          activeOperation.current = null
           setStatus('success')
-          onSuccess?.(result)
+          onSuccessRef.current?.(result)
         } else {
-          const presignRes = await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ fileName: file.name, fileType: file.type, fileSize: file.size }),
-          })
-          if (!presignRes.ok) {
-            const body = await presignRes.json().catch(() => ({}))
-            throw new Error(body?.error || 'Could not start upload')
-          }
-          const { uploadUrl, publicUrl, key } = await presignRes.json()
+          const presignController = new AbortController()
+          activeOperation.current = { kind: 'fetch', controller: presignController }
+          const { uploadUrl, publicUrl, key } = await fetchJSON(
+            endpoint,
+            { fileName: file.name, fileType: file.type, fileSize: file.size },
+            presignController.signal
+          )
+          if (requestToken.current !== myToken) return
 
           await uploadViaXHR(
             uploadUrl,
             'PUT',
             file,
-            (xhr) => (xhrRef.current = xhr),
+            (xhr) => (activeOperation.current = { kind: 'xhr', xhr }),
             setProgress,
             { 'Content-Type': file.type }
           )
-          xhrRef.current = null
+          if (requestToken.current !== myToken) return
 
           // The presigned PUT never let the server see the file's actual
-          // content — ask it to verify now that the bytes are in R2.
+          // content (or verify its real size) — ask it to check now that
+          // the bytes are in R2.
           if (confirmEndpoint) {
-            const confirmRes = await fetch(confirmEndpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ key }),
-            })
-            if (!confirmRes.ok) {
-              const body = await confirmRes.json().catch(() => ({}))
-              throw new Error(body?.error || 'Uploaded file failed verification')
-            }
+            const confirmController = new AbortController()
+            activeOperation.current = { kind: 'fetch', controller: confirmController }
+            await fetchJSON(confirmEndpoint, { key }, confirmController.signal)
+            if (requestToken.current !== myToken) return
           }
 
+          activeOperation.current = null
           setStatus('success')
-          onSuccess?.({ url: publicUrl, key })
+          onSuccessRef.current?.({ url: publicUrl, key })
         }
       } catch (error: any) {
-        xhrRef.current = null
+        activeOperation.current = null
+        if (requestToken.current !== myToken) return // a newer selection already took over
         if (error?.name === 'AbortError') {
           setStatus('idle')
           return
@@ -235,21 +288,18 @@ export function useImageUpload(options?: UseImageUploadOptions): UseImageUploadR
         setStatus('error')
       }
     },
-    [mode, endpoint, confirmEndpoint, validate, onSuccess, setPreviewFile]
+    [mode, endpoint, confirmEndpoint, validate, abort, setPreviewFile]
   )
 
-  const abort = useCallback(() => {
-    xhrRef.current?.abort()
-  }, [])
-
   const reset = useCallback(() => {
-    xhrRef.current?.abort()
-    xhrRef.current = null
+    requestToken.current += 1 // invalidate anything still in flight
+    abort()
+    activeOperation.current = null
     setPreviewFile(null)
     setStatus('idle')
     setProgress(0)
     setErrorMessage(null)
-  }, [setPreviewFile])
+  }, [abort, setPreviewFile])
 
   return { preview, status, progress, errorMessage, selectFile, abort, reset }
 }
