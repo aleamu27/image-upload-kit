@@ -13,7 +13,7 @@ src/
   components/    Dropzone — drag/drop + click-to-browse plumbing, render-prop, no styling
   server/        R2 client, byte verification, presigning, rate limiting, request guards
 
-api-route-templates/   four routes to copy in, pick what you need
+api-route-templates/   five routes to copy in, pick what you need
 ```
 
 Only `react` is required for the client side. `next` / `@aws-sdk/client-s3`
@@ -43,6 +43,7 @@ A second pass over this module itself (not the original) turned up more:
 - **The presign and confirm requests weren't abortable** — only the XHR upload phase was. `abort()` now cancels whichever phase is active via an `AbortController`.
 - **The proxy route's size pre-check could be skipped** by omitting `Content-Length`, and `request.formData()` fully buffers the body regardless of any pre-check anyway (a hard platform limitation of the Web Request API, not something this module can work around). It now also checks `file.size` — the runtime's actual buffered value, not a header — immediately after parsing and before allocating a second buffer via `arrayBuffer()`.
 - **A transient R2 read failure right after upload would delete a genuinely valid image.** `confirm-upload-route.ts`'s verification read is now retried (3 attempts, backoff) before concluding the upload is invalid.
+- **Presign mode had no story for abandoned uploads.** A client that got a presigned URL and then never called `confirmEndpoint` (closed the tab, lost connection, gave up) left an unverified object sitting in R2 forever with nothing tracking or cleaning it up. See "Cleaning up orphaned uploads" below — this is the one gap that surfaced by comparing this module against a much larger production system's bespoke media pipeline, which handles it with a full database-backed lifecycle; this module solves the same problem with a two-prefix scheme instead, so it stays database-free.
 
 ## Install
 
@@ -113,7 +114,40 @@ useImageUpload({
    - `api-route-templates/presign-upload-route.ts` → `app/api/upload/presign/route.ts`
    - `api-route-templates/confirm-upload-route.ts` → `app/api/upload/confirm/route.ts` (presign mode only)
    - `api-route-templates/delete-route.ts` → `app/api/upload/delete/route.ts` (optional)
+   - `api-route-templates/cleanup-pending-route.ts` → `app/api/upload/cleanup/route.ts` (presign mode only, optional — see "Cleaning up orphaned uploads")
 3. Add your own auth check where each template's `TODO` marks it — none of these assume a particular auth system.
+
+## Cleaning up orphaned uploads
+
+Only relevant to presign mode. Proxy mode has no exposure here at all — a
+file lands in its final `uploads/` location synchronously, in one request,
+with no in-between state.
+
+In presign mode, `presign-upload-route.ts` issues keys under `pending/`.
+`confirm-upload-route.ts` **promotes** a verified object — copies it to
+`uploads/`, deletes the `pending/` copy — so a fully confirmed image never
+stays in `pending/`. That means the *only* things that can ever be
+orphaned are objects a client uploaded (or didn't) and then never
+confirmed, and they're always isolated to that one prefix.
+
+**Recommended: an R2 lifecycle rule.** Configure the bucket to delete
+anything under `pending/` after 24-48 hours — zero code, zero
+infrastructure to run, R2 handles it natively:
+
+1. Cloudflare dashboard → R2 → your bucket → **Settings** → **Object lifecycle rules**
+2. Add a rule scoped to prefix `pending/`, action "Delete", age threshold 24-48 hours (whatever's comfortably longer than a real upload should ever take)
+
+(Or via the S3-compatible API/Terraform if you manage infra as code — R2 supports the same `PutBucketLifecycleConfiguration` shape as S3.)
+
+**Fallback: `cleanup-pending-route.ts`.** If you'd rather not touch bucket
+configuration, this route lists and deletes stale `pending/` objects
+itself. Wired for Vercel Cron out of the box (`GET`, checks
+`Authorization: Bearer $CRON_SECRET`, which Vercel sets automatically) —
+add to `vercel.json`:
+
+```json
+{ "crons": [{ "path": "/api/upload/cleanup", "schedule": "0 3 * * *" }] }
+```
 
 ## What's in the logic layer
 
@@ -122,8 +156,8 @@ useImageUpload({
 - **`sniffImageMimeType`** (shared core) — the same byte-signature check used client-side and server-side, so "does this look like a real image" is answered identically in both places.
 - **`validateImageBuffer`** (server) — the authoritative check: size + real content type, ignoring whatever the client claimed.
 - **`createR2Client` / `loadR2ConfigFromEnv`** (server) — throws with the exact missing env var name instead of silently mocking.
-- **`createPresignedUpload` / `fetchObjectHeadBytes` / `fetchObjectSize` / `deleteR2Object`** (server) — the presign-mode building blocks, including the "read back just enough bytes, and the real size, to verify" trick `confirm-upload-route.ts` uses.
-- **`checkRateLimit` / `isRequestTooLarge` / `getClientIP`** (server) — used by all four route templates.
+- **`createPresignedUpload` / `fetchObjectHeadBytes` / `fetchObjectSize` / `promoteUpload` / `deleteR2Object`** (server) — the presign-mode building blocks: issuing the URL, verifying the real bytes/size afterward, and moving a verified object from `pending/` to its permanent `uploads/` location (or deleting it if verification failed).
+- **`checkRateLimit` / `isRequestTooLarge` / `getClientIP`** (server) — used by all five route templates.
 
 ## Security notes
 

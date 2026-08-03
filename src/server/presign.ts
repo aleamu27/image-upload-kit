@@ -3,6 +3,7 @@ import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  CopyObjectCommand,
   type S3Client,
 } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
@@ -73,4 +74,46 @@ export async function fetchObjectSize(client: S3Client, bucketName: string, key:
 
 export async function deleteR2Object(client: S3Client, bucketName: string, key: string): Promise<void> {
   await client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: key }))
+}
+
+export interface PromoteUploadOptions {
+  client: S3Client
+  bucketName: string
+  publicUrl: string
+  pendingKey: string
+  /** Final prefix/folder to move the object into, e.g. 'uploads'. No leading/trailing slash. */
+  folder: string
+}
+
+export interface PromotedUpload {
+  key: string
+  publicUrl: string
+}
+
+/**
+ * Moves a verified object from its temporary "pending" key to its
+ * permanent location — copy then delete, since S3-compatible storage has
+ * no atomic rename. Called by confirm-upload-route.ts once an upload has
+ * passed byte-signature and size verification.
+ *
+ * This is what makes cleaning up abandoned presigned uploads simple: only
+ * objects still under the pending prefix can ever be orphaned (a client
+ * that got a presigned URL and never finished), so an R2 lifecycle rule
+ * (or the optional cleanup-pending-route.ts) only ever needs to target
+ * that one prefix — confirmed images have already moved out of it.
+ */
+export async function promoteUpload(options: PromoteUploadOptions): Promise<PromotedUpload> {
+  const filename = options.pendingKey.split('/').pop()
+  const finalKey = `${options.folder}/${filename}`
+
+  await options.client.send(
+    new CopyObjectCommand({
+      Bucket: options.bucketName,
+      CopySource: `${options.bucketName}/${options.pendingKey}`,
+      Key: finalKey,
+    })
+  )
+  await options.client.send(new DeleteObjectCommand({ Bucket: options.bucketName, Key: options.pendingKey }))
+
+  return { key: finalKey, publicUrl: `${options.publicUrl}/${finalKey}` }
 }

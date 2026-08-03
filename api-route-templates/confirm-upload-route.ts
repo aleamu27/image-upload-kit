@@ -4,9 +4,11 @@
  * Pairs with presign-upload-route.ts. After the client's direct PUT to R2
  * finishes, useImageUpload calls this with the returned `key` to verify
  * the object's real bytes match an allowed image signature, and that its
- * real size doesn't exceed the limit — if either check fails, the object
- * is deleted rather than left sitting in your bucket unverified and
- * publicly reachable.
+ * real size doesn't exceed the limit. If verification passes, the object
+ * is promoted from 'pending/' to 'uploads/' (its permanent location) and
+ * this route returns the final `url`/`key` — use *these*, not the ones
+ * from the presign response, since the object has moved. If verification
+ * fails, the object is deleted rather than promoted.
  *
  * The size check matters because a presigned PUT URL doesn't actually cap
  * upload size: presign-upload-route.ts only checks the *claimed* fileSize
@@ -17,7 +19,7 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { createR2Client, loadR2ConfigFromEnv } from '../src/server/r2-client'
-import { fetchObjectHeadBytes, fetchObjectSize, deleteR2Object } from '../src/server/presign'
+import { fetchObjectHeadBytes, fetchObjectSize, deleteR2Object, promoteUpload } from '../src/server/presign'
 import { sniffImageMimeType, ALLOWED_IMAGE_TYPES } from '../src/core/image-types'
 import { checkRateLimit } from '../src/server/rate-limit'
 import { isRequestTooLarge, getClientIP } from '../src/server/http'
@@ -65,9 +67,10 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
   }
 
-  // Restrict to the folder prefix presign-upload-route.ts issues keys
-  // under, so this route can't be used to probe/delete arbitrary objects.
-  if (!body.key || !body.key.startsWith('uploads/')) {
+  // Restrict to the prefix presign-upload-route.ts issues keys under, so
+  // this route can't be used to promote/probe/delete arbitrary objects —
+  // in particular, never anything already under 'uploads/'.
+  if (!body.key || !body.key.startsWith('pending/')) {
     return NextResponse.json({ error: 'Invalid key' }, { status: 400 })
   }
 
@@ -96,9 +99,19 @@ export async function POST(request: NextRequest) {
 
   if (!sniffed || !(sniffed in ALLOWED_IMAGE_TYPES) || tooLarge) {
     await deleteR2Object(client, config.bucketName, body.key)
-    const error = tooLarge ? `File exceeds the ${MAX_SIZE_MB}MB limit and was removed` : 'Uploaded file is not a valid image and was removed'
+    const error = tooLarge
+      ? `File exceeds the ${MAX_SIZE_MB}MB limit and was removed`
+      : 'Uploaded file is not a valid image and was removed'
     return NextResponse.json({ error }, { status: 400 })
   }
 
-  return NextResponse.json({ ok: true })
+  const promoted = await promoteUpload({
+    client,
+    bucketName: config.bucketName,
+    publicUrl: config.publicUrl,
+    pendingKey: body.key,
+    folder: 'uploads',
+  })
+
+  return NextResponse.json({ ok: true, url: promoted.publicUrl, key: promoted.key })
 }

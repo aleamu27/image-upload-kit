@@ -265,17 +265,23 @@ export function useImageUpload(options?: UseImageUploadOptions): UseImageUploadR
 
           // The presigned PUT never let the server see the file's actual
           // content (or verify its real size) — ask it to check now that
-          // the bytes are in R2.
+          // the bytes are in R2. On success the object has been moved to
+          // its permanent location, so the confirm response's url/key
+          // (not the presign response's) are the real, final ones.
+          let finalUrl = publicUrl
+          let finalKey = key
           if (confirmEndpoint) {
             const confirmController = new AbortController()
             activeOperation.current = { kind: 'fetch', controller: confirmController }
-            await fetchJSON(confirmEndpoint, { key }, confirmController.signal)
+            const confirmResult = await fetchJSON(confirmEndpoint, { key }, confirmController.signal)
             if (requestToken.current !== myToken) return
+            if (confirmResult?.url) finalUrl = confirmResult.url
+            if (confirmResult?.key) finalKey = confirmResult.key
           }
 
           activeOperation.current = null
           setStatus('success')
-          onSuccessRef.current?.({ url: publicUrl, key })
+          onSuccessRef.current?.({ url: finalUrl, key: finalKey })
         }
       } catch (error: any) {
         activeOperation.current = null

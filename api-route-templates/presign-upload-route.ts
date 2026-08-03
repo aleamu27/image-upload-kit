@@ -8,6 +8,14 @@
  * Pair this with confirm-upload-route.ts, which verifies the real content
  * after the client's PUT completes, to get the same guarantee
  * proxy-upload-route.ts gives inline.
+ *
+ * Keys are issued under 'pending/', not the final 'uploads/' folder —
+ * confirm-upload-route.ts promotes (copies, then deletes) a verified
+ * object into 'uploads/' once it passes checks. This keeps "uploaded but
+ * never confirmed" files isolated to one prefix, so cleaning up abandoned
+ * uploads (a client that got a URL and never finished) only ever needs to
+ * target 'pending/' — see the root README's "Cleaning up orphaned
+ * uploads" section. Keep this prefix in sync with confirm-upload-route.ts.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -58,7 +66,7 @@ export async function POST(request: NextRequest) {
     client,
     bucketName: config.bucketName,
     publicUrl: config.publicUrl,
-    folder: 'uploads',
+    folder: 'pending',
     extension: ALLOWED_IMAGE_TYPES[fileType].extension,
     contentType: fileType,
   })
