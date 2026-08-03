@@ -1,0 +1,25 @@
+{
+  "name": "image-upload-kit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reusable, hardened image-upload logic for Next.js + Cloudflare R2: real byte-signature verification (not just trusting file.type), XHR upload with progress/cancel, presigned direct-to-R2 uploads for large files, and rate limiting.",
+  "license": "MIT",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "src",
+    "api-route-templates",
+    ".env.example"
+  ],
+  "peerDependencies": {
+    "react": "^18.0.0 || ^19.0.0",
+    "next": "^14.0.0 || ^15.0.0",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.600.0"
+  },
+  "peerDependenciesMeta": {
+    "next": { "optional": true },
+    "@aws-sdk/client-s3": { "optional": true },
+    "@aws-sdk/s3-request-presigner": { "optional": true }
+  }
+}
